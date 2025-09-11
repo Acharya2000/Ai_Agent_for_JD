@@ -39,6 +39,8 @@ class Jd(TypedDict):
     feedback_history: Annotated[list[str], operator.add]
     Cv_requirement:Annotated[str,Field(description="check enough cv or not")]
     Cv_history:Annotated[list[str],operator.add]
+    retry_cv:int
+    max_retry_cv:int
 
 
 
@@ -117,33 +119,45 @@ def route_evaluation(state:Jd):
 def check_cvs(state: Jd) -> Jd:
     folder_path = "Cv_folder"  # your CV folder
     pdf_files = [f for f in os.listdir(folder_path) if f.endswith(".pdf")]
-    num_pdfs = len(pdf_files)
+    #num_pdfs = len(pdf_files)
 
+    # print(f"Found {num_pdfs} resumes")
+    #waiting for some time 
+    wait=60
+    print(f"waiting for {wait} seconds")
+    time.sleep(wait) 
+
+    #check  no of CV after waiting for some 
+    num_pdfs = len(pdf_files)
     print(f"Found {num_pdfs} resumes")
 
-    if num_pdfs < 1:
-        print("Less than 5 resumes found. Waiting for 60 seconds...")
-        time.sleep(60)  # wait 1 min (can be more)
-        return {"Cv_requirement": "needs_more_resumes"}  # temporary signal
+
+    retry_cv=state["retry_cv"]+1
+
+    if num_pdfs < 2:
+        print(f"Less than 5 resumes found.So we  Waiting for {wait} seconds again ...")
+        return {"Cv_requirement": "needs_more_resumes","retry_cv":retry_cv}  # temporary signal
     else:
-        return {"Cv_requirement": "enough_resumes"}
+        return {"Cv_requirement": "enough_resumes","retry_cv":0}
     
 
 # conditional node to check no of CV enough or not 
 def conditional_cv(state:Jd)->Jd:
-    if state["Cv_requirement"]=="needs_more_resumes":
+    if state["Cv_requirement"]=="needs_more_resumes" and  state["retry_cv"]<state["max_retry_cv"]:
         return "needs_more_resumes"
-    else:
+    elif state["Cv_requirement"]=="enough_resumes":
         return "enough_resumes"
+    else:
+        return "stop_checking"
 
 
 # Nodes for collect CV and then store the metadata of CV into datbase and summary into state
 import sqlite3
 
-def summarize_cv(state:Jd)->Jd:
+def summarize_cv(state: Jd) -> Jd:
     folder_path = "Cv_folder"
     pdf_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith(".pdf")]
-    summary_history=[]
+    summary_history = []
     
     # --- Setup SQLite connection ---
     conn = sqlite3.connect("resumes.db")
@@ -155,13 +169,13 @@ def summarize_cv(state:Jd)->Jd:
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
         phone TEXT,
-        email TEXT,
+        email TEXT UNIQUE,   -- make email unique
         summary TEXT
     )
     """)
     
     for pdf in pdf_files:
-        loader=PyPDFLoader(pdf)
+        loader = PyPDFLoader(pdf)
         docs = loader.load()
         text = " ".join([doc.page_content for doc in docs])
         
@@ -175,21 +189,25 @@ Extract the following information from this resume:
 Resume text:
 {text}
 """
-        response=resume_output_llm.invoke(query)
-        
+        response = resume_output_llm.invoke(query)
+
         # Save summary in state
         summary_history.append(response.summary)
+
+        # --- Check if email already exists ---
+        cursor.execute("SELECT id FROM candidates WHERE email = ?", (response.email,))
+        existing = cursor.fetchone()
         
-        # --- Insert metadata into database ---
-        cursor.execute("""
-        INSERT INTO candidates (name, phone, email, summary) VALUES (?, ?, ?, ?)
-        """, (response.name, response.phone, response.email, response.summary))
+        if not existing:  # only insert if not found
+            cursor.execute("""
+            INSERT INTO candidates (name, phone, email, summary) VALUES (?, ?, ?, ?)
+            """, (response.name, response.phone, response.email, response.summary))
     
     # Commit and close DB connection
     conn.commit()
     conn.close()
 
-    return {"Cv_history":summary_history}
+    return {"Cv_history": summary_history}
 
     
 
@@ -212,7 +230,7 @@ graph.add_edge("jd_genearation","jd_evaluation")
 #add conditional edge
 graph.add_conditional_edges("jd_evaluation", route_evaluation, {'approved':'check_cvs' , 'needs_improvement': 'optimize_tweet'})
 graph.add_edge("optimize_tweet","jd_evaluation")
-graph.add_conditional_edges("check_cvs",conditional_cv,{'enough_resumes':'summarize_cv','needs_more_resumes':"check_cvs"})
+graph.add_conditional_edges("check_cvs",conditional_cv,{'enough_resumes':'summarize_cv','needs_more_resumes':"check_cvs","stop_checking":'summarize_cv'})
 graph.add_edge("summarize_cv",END)
 
 
@@ -226,7 +244,10 @@ workflow
 initial_state = {
     "topic": "Data Science",
     "iteration": 0,
-    "max_iteration": 5
+    "max_iteration": 5,
+    "retry_cv":0,
+    "max_retry_cv":3
+
 }
 result = workflow.invoke(initial_state)
 
