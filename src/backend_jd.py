@@ -2,7 +2,7 @@
 
 from langgraph.graph import StateGraph,START,END
 from typing import TypedDict,Annotated,Literal
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI,OpenAIEmbeddings
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 import operator
@@ -10,6 +10,8 @@ import os
 from langchain_core.messages import HumanMessage,SystemMessage
 import time
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
 
 
 
@@ -25,6 +27,8 @@ evaluator_llm=ChatOpenAI(api_key=api_key,model="gpt-4o")
 optimizer_llm=ChatOpenAI(api_key=api_key,model="gpt-4o")
 #this llm give mobile no,email,and resume summary
 resume_llm=ChatOpenAI(model="gpt-4o-mini")
+#embedding model 
+emb_model=OpenAIEmbeddings(model='text-embedding-3-small')
 
 
 #define the state
@@ -39,8 +43,10 @@ class Jd(TypedDict):
     feedback_history: Annotated[list[str], operator.add]
     Cv_requirement:Annotated[str,Field(description="check enough cv or not")]
     Cv_history:Annotated[list[str],operator.add]
+    full_cv:Annotated[list[str],operator.add]
     retry_cv:int
     max_retry_cv:int
+    selected_student_for_interview:Annotated[list[dict],operator.add]
 
 
 
@@ -57,6 +63,7 @@ class OutputStructure(BaseModel):
     phone: Annotated[str, Field(description="Phone number of the student")]
     email:Annotated[str,Field(description="Email address of the student ")]
     summary: Annotated[str, Field(description="Summary of the resume within 100 words")]
+    full_cv:Annotated[str,Field(description="Give a clean  text for the Full CV which represent the student CV like score,Skill,Project ")]
 
 resume_output_llm=resume_llm.with_structured_output(OutputStructure)
 
@@ -118,14 +125,21 @@ def route_evaluation(state:Jd):
 # cv check node 
 def check_cvs(state: Jd) -> Jd:
     folder_path = "Cv_folder"  # your CV folder
-    pdf_files = [f for f in os.listdir(folder_path) if f.endswith(".pdf")]
-    #num_pdfs = len(pdf_files)
 
-    # print(f"Found {num_pdfs} resumes")
     #waiting for some time 
     wait=60
     print(f"waiting for {wait} seconds")
     time.sleep(wait) 
+
+
+    pdf_files = [f for f in os.listdir(folder_path) if f.endswith(".pdf")]
+    # #num_pdfs = len(pdf_files)
+
+    # # print(f"Found {num_pdfs} resumes")
+    # #waiting for some time 
+    # wait=60
+    # print(f"waiting for {wait} seconds")
+    # time.sleep(wait) 
 
     #check  no of CV after waiting for some 
     num_pdfs = len(pdf_files)
@@ -134,7 +148,7 @@ def check_cvs(state: Jd) -> Jd:
 
     retry_cv=state["retry_cv"]+1
 
-    if num_pdfs < 2:
+    if num_pdfs < 1:
         print(f"Less than 5 resumes found.So we  Waiting for {wait} seconds again ...")
         return {"Cv_requirement": "needs_more_resumes","retry_cv":retry_cv}  # temporary signal
     else:
@@ -158,6 +172,7 @@ def summarize_cv(state: Jd) -> Jd:
     folder_path = "Cv_folder"
     pdf_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith(".pdf")]
     summary_history = []
+    full_cv=[]
     
     # --- Setup SQLite connection ---
     conn = sqlite3.connect("resumes.db")
@@ -170,7 +185,8 @@ def summarize_cv(state: Jd) -> Jd:
         name TEXT,
         phone TEXT,
         email TEXT UNIQUE,   -- make email unique
-        summary TEXT
+        summary TEXT,
+        full_cv TEXT
     )
     """)
     
@@ -185,6 +201,7 @@ Extract the following information from this resume:
 2. Phone number (if available)
 3. Email of the student
 4. A summary of the resume (within 100 words)
+5.A clean text for the entire CV 
 
 Resume text:
 {text}
@@ -193,6 +210,7 @@ Resume text:
 
         # Save summary in state
         summary_history.append(response.summary)
+        full_cv.append(response.full_cv)
 
         # --- Check if email already exists ---
         cursor.execute("SELECT id FROM candidates WHERE email = ?", (response.email,))
@@ -200,19 +218,65 @@ Resume text:
         
         if not existing:  # only insert if not found
             cursor.execute("""
-            INSERT INTO candidates (name, phone, email, summary) VALUES (?, ?, ?, ?)
-            """, (response.name, response.phone, response.email, response.summary))
+            INSERT INTO candidates (name, phone, email, summary,full_cv) VALUES (?, ?, ?, ?,?)
+            """, (response.name, response.phone, response.email, response.summary,response.full_cv))
     
     # Commit and close DB connection
     conn.commit()
     conn.close()
 
-    return {"Cv_history": summary_history}
+    return {"Cv_history": summary_history,"full_cv":full_cv}
 
     
 
+# define embedding and retrival node 
+def embedding_cv(state: Jd) -> Jd:
+    # --- Load candidates from DB ---
+    conn = sqlite3.connect("resumes.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT name, phone, email, summary,full_cv FROM candidates")
+    rows = cursor.fetchall()
+    conn.close()
 
- 
+    #check if any student apply or not 
+    if not rows:
+        print("No candidates in DB to index.")
+        return {"selected_student_for_interview": []}
+
+    # Convert DB rows → Documents with metadata
+    docs = [
+        Document(
+            page_content=row[4],  # full cv
+            metadata={
+                "name": row[0],
+                "phone": row[1],
+                "email": row[2]
+            }
+        )
+        for row in rows
+    ]
+
+    # Build FAISS index
+    vs = FAISS.from_documents(docs, emb_model)
+    vs.save_local("faiss_index")
+
+    retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+    results = retriever.invoke(state["tweet"])  # query with JD/tweet
+
+    # Extract metadata of top matches
+    top_matches = [
+        {
+            "name": doc.metadata.get("name"),
+            "email": doc.metadata.get("email"),
+            "phone": doc.metadata.get("phone"),
+            "matched_summary": doc.page_content
+        }
+        for doc in results
+    ]
+
+    return {"selected_student_for_interview": top_matches}
+
+
 
 #create the graph 
 graph=StateGraph(Jd)
@@ -222,6 +286,8 @@ graph.add_node("jd_evaluation",jd_evaluation)
 graph.add_node("optimize_tweet",optimize_tweet)
 graph.add_node('check_cvs',check_cvs)
 graph.add_node('summarize_cv',summarize_cv)
+graph.add_node("embedding_cv",embedding_cv)
+
 
 #add edges 
 graph.add_edge(START,"jd_genearation")
@@ -231,7 +297,8 @@ graph.add_edge("jd_genearation","jd_evaluation")
 graph.add_conditional_edges("jd_evaluation", route_evaluation, {'approved':'check_cvs' , 'needs_improvement': 'optimize_tweet'})
 graph.add_edge("optimize_tweet","jd_evaluation")
 graph.add_conditional_edges("check_cvs",conditional_cv,{'enough_resumes':'summarize_cv','needs_more_resumes':"check_cvs","stop_checking":'summarize_cv'})
-graph.add_edge("summarize_cv",END)
+graph.add_edge("summarize_cv","embedding_cv")
+graph.add_edge("embedding_cv",END)
 
 
 
@@ -254,4 +321,4 @@ result = workflow.invoke(initial_state)
 
 # print(result["feedback"])
 # print(result["tweet"])
-print(result['Cv_history'])
+print(result['selected_student_for_interview'])

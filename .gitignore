@@ -2,6 +2,7 @@
 myenv
 resumes.db
 Cv_folder
+faiss_index
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
