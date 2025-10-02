@@ -4,7 +4,7 @@ from langgraph.graph import StateGraph,START,END
 from typing import TypedDict,Annotated,Literal
 from langchain_openai import ChatOpenAI,OpenAIEmbeddings
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field,field_validator
 import operator
 import os
 from langchain_core.messages import HumanMessage,SystemMessage
@@ -12,7 +12,11 @@ import time
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-
+from langsmith import traceable
+from datetime import datetime
+from langchain_core.tools import tool
+import smtplib
+from email.mime.text import MIMEText
 
 
 #set up the openAi model 
@@ -47,6 +51,8 @@ class Jd(TypedDict):
     retry_cv:int
     max_retry_cv:int
     selected_student_for_interview:Annotated[list[dict],operator.add]
+    mail_generated_for_selected_students:Annotated[list[dict],operator.add]
+    mails_sent:Annotated[list[str],operator.add]
 
 
 
@@ -68,6 +74,7 @@ class OutputStructure(BaseModel):
 resume_output_llm=resume_llm.with_structured_output(OutputStructure)
 
 #define the jd_generation node
+@traceable(name="Generate Jd", tags=["dimension:language"], metadata={"dimension": "language"})
 def jd_genearation(state:Jd)->Jd:
     message=[
         SystemMessage(content="you are a post genrator for a particular job topic"),
@@ -81,6 +88,7 @@ def jd_genearation(state:Jd)->Jd:
 # define the evaluation node
 structured_evaluator_llm = evaluator_llm.with_structured_output(output_schema)
 
+@traceable(name="evaluate_Jd", tags=["dimension:Analysis"], metadata={"dimension": "Analysis the tweet"})
 def jd_evaluation(state:Jd)->Jd:
     query=f"Evaluate this job discription {state['tweet']} for this topic {state['topic']} and give a feedback "
     response=structured_evaluator_llm.invoke(query)
@@ -91,6 +99,8 @@ def jd_evaluation(state:Jd)->Jd:
 
 
 # define jd_update node
+
+@traceable(name="Update Jd", tags=["dimension:optimize"], metadata={"dimension": "optimize the tweet "})
 def optimize_tweet(state:Jd):
 
     messages = [
@@ -114,7 +124,8 @@ Re-write it as a short, viral-worthy tweet. Avoid Q&A style and stay under 280 c
 
 
 
-# Conditional node for JD update 
+#--------------------------------------Conditional node for JD update --------------------------------------------------
+@traceable(name="Conditional Node for Jd", tags=["dimension:decision"], metadata={"dimension": "decision to go back to Optimize or not"})
 def route_evaluation(state:Jd):
 
     if state['evaluation'] == 'approved' or state['iteration'] >= state['max_iteration']:
@@ -122,7 +133,8 @@ def route_evaluation(state:Jd):
     else:
         return 'needs_improvement'
 
-# cv check node 
+#-------------------------------------------cv check node--------------------------------------------------------
+@traceable(name="Check_no_of_cv", tags=["dimension:Count CV"], metadata={"dimension": "Count no of application"})
 def check_cvs(state: Jd) -> Jd:
     folder_path = "Cv_folder"  # your CV folder
 
@@ -155,7 +167,9 @@ def check_cvs(state: Jd) -> Jd:
         return {"Cv_requirement": "enough_resumes","retry_cv":0}
     
 
-# conditional node to check no of CV enough or not 
+#---------------------------conditional node to check no of CV enough or not---------------------------------------
+
+@traceable(name="Check_enough_Cv_or_not", tags=["dimension:Enough Cv"], metadata={"dimension": "Enough Cv or not"})
 def conditional_cv(state:Jd)->Jd:
     if state["Cv_requirement"]=="needs_more_resumes" and  state["retry_cv"]<state["max_retry_cv"]:
         return "needs_more_resumes"
@@ -165,9 +179,9 @@ def conditional_cv(state:Jd)->Jd:
         return "stop_checking"
 
 
-# Nodes for collect CV and then store the metadata of CV into datbase and summary into state
+#------------------------Nodes for collect CV and then store the metadata of CV into datbase and summary into state---------------
 import sqlite3
-
+@traceable(name="Summarize Cv", tags=["dimension:CV extract"], metadata={"dimension": "We collect the CV text "})
 def summarize_cv(state: Jd) -> Jd:
     folder_path = "Cv_folder"
     pdf_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith(".pdf")]
@@ -229,7 +243,9 @@ Resume text:
 
     
 
-# define embedding and retrival node 
+#--------------------------------------define embedding and retrival node--------------------------------------------- 
+
+@traceable(name="Retrive CV ", tags=["dimension:Retrive CV"], metadata={"dimension": "Here we retrive Student for the Job"})
 def embedding_cv(state: Jd) -> Jd:
     # --- Load candidates from DB ---
     conn = sqlite3.connect("resumes.db")
@@ -260,7 +276,7 @@ def embedding_cv(state: Jd) -> Jd:
     vs = FAISS.from_documents(docs, emb_model)
     vs.save_local("faiss_index")
 
-    retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+    retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": 1})
     results = retriever.invoke(state["tweet"])  # query with JD/tweet
 
     # Extract metadata of top matches
@@ -269,7 +285,7 @@ def embedding_cv(state: Jd) -> Jd:
             "name": doc.metadata.get("name"),
             "email": doc.metadata.get("email"),
             "phone": doc.metadata.get("phone"),
-            "matched_summary": doc.page_content
+            #"matched_summary": doc.page_content
         }
         for doc in results
     ]
@@ -277,8 +293,88 @@ def embedding_cv(state: Jd) -> Jd:
     return {"selected_student_for_interview": top_matches}
 
 
+# -----------------------------Here our LLM generate a email for selected student----------------------------------------
 
-#create the graph 
+# Pydantic for mail 
+class PydanticMail(BaseModel):
+    mail: Annotated[str, Field(description="Generate the mail with date also and date should be between 7/01/2026 to 9/30/2026")]
+    date: Annotated[str, Field(description="Here give the date you selected for interview")]
+
+    # @field_validator("date")
+    # def validate_date_range(cls, value):
+    #     try:
+    #         # Parse input date (assuming format YYYY-MM-DD)
+    #         dt = datetime.strptime(value, "%Y-%m-%d")
+    #     except ValueError:
+    #         raise ValueError("Date must be in format YYYY-MM-DD")
+
+    #     # Allowed interval: July 1, 2025 → Sept 30, 2025
+    #     start = datetime(2026, 7, 1)
+    #     end = datetime(2026, 9, 30)
+
+    #     if not (start <= dt <= end):
+    #         raise ValueError("Date must be between July 2025 and September 2025")
+
+    #     return value
+    
+#define the generator 
+mail_llm=generator_llm.with_structured_output(PydanticMail)
+
+def mail_generated_llm(state:Jd):
+    mail_history=[]
+    for i in state["selected_student_for_interview"]:
+        Query=f""" generated a mail for this student name {i["name"]}
+    and also give  a interview data in the mail
+    """ 
+        response=mail_llm.invoke(Query)
+        mail_history.append({"mail":response.mail,"date":response.date})
+    return {"mail_generated_for_selected_students":mail_history}
+
+#----------------------------------Human in the loop----------------------------------------------------------------
+def human_approval_date(state:Jd):
+    pass 
+
+
+#------------------------mail sending tool-----------------------------------------------------------------------
+
+@tool
+def send_email_tool(to_email: str, subject: str, body: str):
+    """Send an email to the candidate using environment variables for credentials."""
+    
+    sender_email = os.getenv("EMAIL_USER")
+    sender_password = os.getenv("EMAIL_PASSWORD")
+    
+    if not sender_email or not sender_password:
+        raise ValueError("Email credentials not set in environment variables!")
+    
+    # Construct email message
+    msg = MIMEText(body, "plain")
+    msg["Subject"] = subject
+    msg["From"] = sender_email
+    msg["To"] = to_email
+    
+    # Send mail using SMTP SSL
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(sender_email, sender_password)
+        server.sendmail(sender_email, to_email, msg.as_string())
+    
+    return f"✅ Email sent to {to_email}"
+
+def send_mails_node(state: Jd):
+    sent_history = []
+    for student, mail_data in zip(state["selected_student_for_interview"],
+                                  state["mail_generated_for_selected_students"]):
+        subject = "Interview Invitation"
+        body = mail_data["mail"]
+        candidate_email = student["email"]  # make sure your state has emails!
+
+        result = send_email_tool.func(candidate_email, subject, body)  # call tool
+        sent_history.append({"student": student["name"], "status": result})
+    
+    return {"mails_sent": sent_history}
+
+
+#-----------------------------------------------create the graph------------------------------------------------------
 graph=StateGraph(Jd)
 # add nodes 
 graph.add_node("jd_genearation",jd_genearation)
@@ -287,6 +383,8 @@ graph.add_node("optimize_tweet",optimize_tweet)
 graph.add_node('check_cvs',check_cvs)
 graph.add_node('summarize_cv',summarize_cv)
 graph.add_node("embedding_cv",embedding_cv)
+graph.add_node("mail_generated_llm",mail_generated_llm)
+#graph.add_node("send_mails_node",send_mails_node)
 
 
 #add edges 
@@ -298,8 +396,9 @@ graph.add_conditional_edges("jd_evaluation", route_evaluation, {'approved':'chec
 graph.add_edge("optimize_tweet","jd_evaluation")
 graph.add_conditional_edges("check_cvs",conditional_cv,{'enough_resumes':'summarize_cv','needs_more_resumes':"check_cvs","stop_checking":'summarize_cv'})
 graph.add_edge("summarize_cv","embedding_cv")
-graph.add_edge("embedding_cv",END)
-
+graph.add_edge("embedding_cv","mail_generated_llm")
+graph.add_edge("mail_generated_llm",END)
+#graph.add_edge("send_mails_node",END)
 
 
 workflow = graph.compile()
@@ -309,7 +408,7 @@ workflow
 
 #define initial state
 initial_state = {
-    "topic": "Data Science",
+    "topic": "generate Job description for my company name Laxmi chect fund ,For this topic Data science ,with required skill,python,Mlops,ML,DL",
     "iteration": 0,
     "max_iteration": 5,
     "retry_cv":0,
@@ -321,4 +420,5 @@ result = workflow.invoke(initial_state)
 
 # print(result["feedback"])
 # print(result["tweet"])
-print(result['selected_student_for_interview'])
+print("selected students:",result['selected_student_for_interview'])
+print("mail_histroy",result["mail_generated_for_selected_students"])
