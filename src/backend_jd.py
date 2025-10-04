@@ -45,14 +45,18 @@ class Jd(TypedDict):
     max_iteration: Annotated[int,Field(description="max no iteration ")]
     tweet_history: Annotated[list[str], operator.add]
     feedback_history: Annotated[list[str], operator.add]
+    min_no_cv_you_want:int
     Cv_requirement:Annotated[str,Field(description="check enough cv or not")]
     Cv_history:Annotated[list[str],operator.add]
     full_cv:Annotated[list[str],operator.add]
     retry_cv:int
     max_retry_cv:int
     selected_student_for_interview:Annotated[list[dict],operator.add]
+    #human_permission_for_interview:Annotated[str,Field(description="please select the interview date")]
+    interview_date:Annotated[str,Field(description="here we select the interview date for student")]
+    interview_time:Annotated[str,Field(description="here we select the interview time for student")]
     mail_generated_for_selected_students:Annotated[list[dict],operator.add]
-    mails_sent:Annotated[list[str],operator.add]
+    #mails_sent:Annotated[list[str],operator.add]
 
 
 
@@ -160,8 +164,8 @@ def check_cvs(state: Jd) -> Jd:
 
     retry_cv=state["retry_cv"]+1
 
-    if num_pdfs < 1:
-        print(f"Less than 5 resumes found.So we  Waiting for {wait} seconds again ...")
+    if num_pdfs < state["min_no_cv_you_want"]:
+        print(f"Less than {state["min_no_cv_you_want"]} resumes found.So we  Waiting for {wait} seconds again ...")
         return {"Cv_requirement": "needs_more_resumes","retry_cv":retry_cv}  # temporary signal
     else:
         return {"Cv_requirement": "enough_resumes","retry_cv":0}
@@ -293,85 +297,81 @@ def embedding_cv(state: Jd) -> Jd:
     return {"selected_student_for_interview": top_matches}
 
 
+#--------------------------------------------Human permission for date and time----------------------------------------
+def fix_date_time(state:Jd):
+    interview_date=input("give a interview date")
+    interview_time=input("give a interview time")
+
+    return {"interview_date":interview_date,"interview_time":interview_time}
+
+
+
 # -----------------------------Here our LLM generate a email for selected student----------------------------------------
 
 # Pydantic for mail 
 class PydanticMail(BaseModel):
-    mail: Annotated[str, Field(description="Generate the mail with date also and date should be between 7/01/2026 to 9/30/2026")]
-    date: Annotated[str, Field(description="Here give the date you selected for interview")]
+    mail: Annotated[str, Field(description="Generate the mail with date also and date should given date")]
+    date: Annotated[str, Field(description="Here give the date and time  you selected for interview")]
 
-    # @field_validator("date")
-    # def validate_date_range(cls, value):
-    #     try:
-    #         # Parse input date (assuming format YYYY-MM-DD)
-    #         dt = datetime.strptime(value, "%Y-%m-%d")
-    #     except ValueError:
-    #         raise ValueError("Date must be in format YYYY-MM-DD")
-
-    #     # Allowed interval: July 1, 2025 → Sept 30, 2025
-    #     start = datetime(2026, 7, 1)
-    #     end = datetime(2026, 9, 30)
-
-    #     if not (start <= dt <= end):
-    #         raise ValueError("Date must be between July 2025 and September 2025")
-
-    #     return value
     
-#define the generator 
+
+
+    
+#define the mail generator 
 mail_llm=generator_llm.with_structured_output(PydanticMail)
 
 def mail_generated_llm(state:Jd):
     mail_history=[]
+    n=len(state["selected_student_for_interview"])
+    a=0
     for i in state["selected_student_for_interview"]:
         Query=f""" generated a mail for this student name {i["name"]}
-    and also give  a interview data in the mail
+    and also give  a interview data {state["interview_date"]} and time should be  {state["interview_time"]} with addition time 
+     {a*30} min  in the mail
     """ 
         response=mail_llm.invoke(Query)
         mail_history.append({"mail":response.mail,"date":response.date})
+        a+=1
     return {"mail_generated_for_selected_students":mail_history}
-
-#----------------------------------Human in the loop----------------------------------------------------------------
-def human_approval_date(state:Jd):
-    pass 
 
 
 #------------------------mail sending tool-----------------------------------------------------------------------
 
-@tool
-def send_email_tool(to_email: str, subject: str, body: str):
-    """Send an email to the candidate using environment variables for credentials."""
+# @tool
+# def send_email_tool(to_email: str, subject: str, body: str):
+#     """Send an email to the candidate using environment variables for credentials."""
     
-    sender_email = os.getenv("EMAIL_USER")
-    sender_password = os.getenv("EMAIL_PASSWORD")
+#     sender_email = os.getenv("EMAIL_USER")
+#     sender_password = os.getenv("EMAIL_PASSWORD")
     
-    if not sender_email or not sender_password:
-        raise ValueError("Email credentials not set in environment variables!")
+#     if not sender_email or not sender_password:
+#         raise ValueError("Email credentials not set in environment variables!")
     
-    # Construct email message
-    msg = MIMEText(body, "plain")
-    msg["Subject"] = subject
-    msg["From"] = sender_email
-    msg["To"] = to_email
+#     # Construct email message
+#     msg = MIMEText(body, "plain")
+#     msg["Subject"] = subject
+#     msg["From"] = sender_email
+#     msg["To"] = to_email
     
-    # Send mail using SMTP SSL
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(sender_email, sender_password)
-        server.sendmail(sender_email, to_email, msg.as_string())
+#     # Send mail using SMTP SSL
+#     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+#         server.login(sender_email, sender_password)
+#         server.sendmail(sender_email, to_email, msg.as_string())
     
-    return f"✅ Email sent to {to_email}"
+#     return f"✅ Email sent to {to_email}"
 
-def send_mails_node(state: Jd):
-    sent_history = []
-    for student, mail_data in zip(state["selected_student_for_interview"],
-                                  state["mail_generated_for_selected_students"]):
-        subject = "Interview Invitation"
-        body = mail_data["mail"]
-        candidate_email = student["email"]  # make sure your state has emails!
+# def send_mails_node(state: Jd):
+#     sent_history = []
+#     for student, mail_data in zip(state["selected_student_for_interview"],
+#                                   state["mail_generated_for_selected_students"]):
+#         subject = "Interview Invitation"
+#         body = mail_data["mail"]
+#         candidate_email = student["email"]  # make sure your state has emails!
 
-        result = send_email_tool.func(candidate_email, subject, body)  # call tool
-        sent_history.append({"student": student["name"], "status": result})
+#         result = send_email_tool.func(candidate_email, subject, body)  # call tool
+#         sent_history.append({"student": student["name"], "status": result})
     
-    return {"mails_sent": sent_history}
+#     return {"mails_sent": sent_history}
 
 
 #-----------------------------------------------create the graph------------------------------------------------------
@@ -384,6 +384,7 @@ graph.add_node('check_cvs',check_cvs)
 graph.add_node('summarize_cv',summarize_cv)
 graph.add_node("embedding_cv",embedding_cv)
 graph.add_node("mail_generated_llm",mail_generated_llm)
+graph.add_node("fix_date_time",fix_date_time)
 #graph.add_node("send_mails_node",send_mails_node)
 
 
@@ -396,7 +397,8 @@ graph.add_conditional_edges("jd_evaluation", route_evaluation, {'approved':'chec
 graph.add_edge("optimize_tweet","jd_evaluation")
 graph.add_conditional_edges("check_cvs",conditional_cv,{'enough_resumes':'summarize_cv','needs_more_resumes':"check_cvs","stop_checking":'summarize_cv'})
 graph.add_edge("summarize_cv","embedding_cv")
-graph.add_edge("embedding_cv","mail_generated_llm")
+graph.add_edge("embedding_cv","fix_date_time")
+graph.add_edge("fix_date_time","mail_generated_llm")
 graph.add_edge("mail_generated_llm",END)
 #graph.add_edge("send_mails_node",END)
 
@@ -412,7 +414,8 @@ initial_state = {
     "iteration": 0,
     "max_iteration": 5,
     "retry_cv":0,
-    "max_retry_cv":3
+    "max_retry_cv":3,
+    "min_no_cv_you_want":1
 
 }
 result = workflow.invoke(initial_state)
