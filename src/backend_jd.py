@@ -17,11 +17,13 @@ from datetime import datetime
 from langchain_core.tools import tool
 import smtplib
 from email.mime.text import MIMEText
+import requests
 
-
+from fastapi import FastAPI
 #set up the openAi model 
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
+
 
 #this llm genrate the post 
 generator_llm=ChatOpenAI(api_key=api_key,model="gpt-4o")
@@ -35,6 +37,7 @@ resume_llm=ChatOpenAI(model="gpt-4o-mini")
 emb_model=OpenAIEmbeddings(model='text-embedding-3-small')
 
 
+
 #define the state
 class Jd(TypedDict):
     topic : Annotated[str,Field(description="here we give the topic of JD")]
@@ -46,6 +49,7 @@ class Jd(TypedDict):
     tweet_history: Annotated[list[str], operator.add]
     feedback_history: Annotated[list[str], operator.add]
     min_no_cv_you_want:int
+    min_no_days_you_want_to_collect_cv:int
     Cv_requirement:Annotated[str,Field(description="check enough cv or not")]
     Cv_history:Annotated[list[str],operator.add]
     full_cv:Annotated[list[str],operator.add]
@@ -58,7 +62,8 @@ class Jd(TypedDict):
     mail_generated_for_selected_students:Annotated[list[dict],operator.add]
     #mails_sent:Annotated[list[str],operator.add]
 
-
+#Jd store here 
+jd=[]
 
 #pydantic schema for the output of evaluation node
 class output_schema(BaseModel):
@@ -84,7 +89,10 @@ def jd_genearation(state:Jd)->Jd:
         SystemMessage(content="you are a post genrator for a particular job topic"),
         HumanMessage(content=f"generate a job description on this topic {state['topic']}")
     ]
-    response=generator_llm.invoke(message).content
+    try:
+        response=generator_llm.invoke(message).content
+    except Exception as e:
+        raise Exception("LLM call fail")
 
     return {"tweet":response,"tweet_history":[response]}
 
@@ -95,8 +103,11 @@ structured_evaluator_llm = evaluator_llm.with_structured_output(output_schema)
 @traceable(name="evaluate_Jd", tags=["dimension:Analysis"], metadata={"dimension": "Analysis the tweet"})
 def jd_evaluation(state:Jd)->Jd:
     query=f"Evaluate this job discription {state['tweet']} for this topic {state['topic']} and give a feedback "
-    response=structured_evaluator_llm.invoke(query)
-
+    try:
+        response=structured_evaluator_llm.invoke(query)
+    except Exception as e:
+        raise Exception("run time error ")
+        
 
     return {"evaluation":response.evaluation,"feedback":response.feedback,"feedback_history":[response.feedback]}
     
@@ -128,14 +139,51 @@ Re-write it as a short, viral-worthy tweet. Avoid Q&A style and stay under 280 c
 
 
 
+
 #--------------------------------------Conditional node for JD update --------------------------------------------------
 @traceable(name="Conditional Node for Jd", tags=["dimension:decision"], metadata={"dimension": "decision to go back to Optimize or not"})
 def route_evaluation(state:Jd):
 
     if state['evaluation'] == 'approved' or state['iteration'] >= state['max_iteration']:
+        jd.append(state["tweet"])
         return 'approved'
     else:
         return 'needs_improvement'
+    
+
+#----------------------Post Jd in Linkdin--------------------------------------------------------------------
+
+@traceable(name="Post JD on LinkedIn", tags=["dimension:Post"], metadata={"dimension": "post job on LinkedIn"})
+def post_linkedin(state: Jd) -> Jd:
+    """
+    Post the job description to LinkedIn via your FastAPI service.
+    Expects `state['tweet']` to contain the JD.
+    """
+
+    # Load API URL and token from environment
+    api_url = os.getenv("LINKEDIN_API_URL")  # e.g., "http://51.21.221.225:8000/post-job"
+    access_token = os.getenv("LINKEDIN_ACCESS_TOKEN")  # your token in .env
+
+    if not api_url:
+        raise ValueError("LINKEDIN_API_URL not set in environment variables!")
+    if not access_token:
+        raise ValueError("LINKEDIN_ACCESS_TOKEN not set in environment variables!")
+
+    # Only post the job text (no form, no image)
+    data = {
+        "access_token": access_token,
+        "job_text": state["tweet"]
+    }
+
+    response = requests.post(api_url, data=data)
+
+    if response.status_code != 200:
+        raise Exception(f"Failed to post job: {response.status_code} - {response.text}")
+
+    print("✅ Job posted on LinkedIn successfully!")
+    return {"linkedin_post_status": "success", "linkedin_response": response.json()}
+
+
 
 #-------------------------------------------cv check node--------------------------------------------------------
 @traceable(name="Check_no_of_cv", tags=["dimension:Count CV"], metadata={"dimension": "Count no of application"})
@@ -183,7 +231,7 @@ def conditional_cv(state:Jd)->Jd:
         return "stop_checking"
 
 
-#------------------------Nodes for collect CV and then store the metadata of CV into datbase and summary into state---------------
+#------------------------Nodes for collect CV and then store the metadata of CV into database and summary into state---------------
 import sqlite3
 @traceable(name="Summarize Cv", tags=["dimension:CV extract"], metadata={"dimension": "We collect the CV text "})
 def summarize_cv(state: Jd) -> Jd:
@@ -299,8 +347,8 @@ def embedding_cv(state: Jd) -> Jd:
 
 #--------------------------------------------Human permission for date and time----------------------------------------
 def fix_date_time(state:Jd):
-    interview_date=input("give a interview date")
-    interview_time=input("give a interview time")
+    interview_date=state["interview_date"]
+    interview_time=state["interview_time"]
 
     return {"interview_date":interview_date,"interview_time":interview_time}
 
@@ -405,23 +453,41 @@ graph.add_edge("mail_generated_llm",END)
 
 workflow = graph.compile()
 
-workflow
 
 
-#define initial state
-initial_state = {
-    "topic": "generate Job description for my company name Laxmi chect fund ,For this topic Data science ,with required skill,python,Mlops,ML,DL",
-    "iteration": 0,
-    "max_iteration": 5,
-    "retry_cv":0,
-    "max_retry_cv":3,
-    "min_no_cv_you_want":1
+# #define initial state
+# initial_state = {
+#     "topic": "generate Job description for my company name Laxmi chect fund ,For this topic Data science ,with required skill,python,Mlops,ML,DL",
+#     "iteration": 0,
+#     "max_iteration": 5,
+#     "retry_cv":0,
+#     "max_retry_cv":3,
+#     "min_no_cv_you_want":1
 
-}
-result = workflow.invoke(initial_state)
+# }
+# result = workflow.invoke(initial_state)
 
 
-# print(result["feedback"])
-# print(result["tweet"])
-print("selected students:",result['selected_student_for_interview'])
-print("mail_histroy",result["mail_generated_for_selected_students"])
+# # print(result["feedback"])
+# # # print(result["tweet"])
+# # print("selected students:",result['selected_student_for_interview'])
+# # print("mail_histroy",result["mail_generated_for_selected_students"])
+
+
+# #------------------------add API--------------------------------------------------------------------------------
+# from fastapi import FastAPI
+# app=FastAPI()
+
+# @app.post("/predict")
+# def comlplete_workflow():
+#     initial_state = {
+#     "topic": "generate Job description for my company name Laxmi chect fund ,For this topic Data science ,with required skill,python,Mlops,ML,DL",
+#     "iteration": 0,
+#     "max_iteration": 5,
+#     "retry_cv":0,
+#     "max_retry_cv":3,
+#     "min_no_cv_you_want":1
+#     }
+#     result = workflow.invoke(initial_state)
+#     return {"result":result}
+
