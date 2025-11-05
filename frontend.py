@@ -4,7 +4,7 @@ import requests
 st.title("Job Description Generator & Candidate Selector")
 
 # ---------- Inputs ----------
-api_key = st.text_input("OpenAI API Key", type="password")
+#api_key = st.text_input("OpenAI API Key", type="password")
 
 topic = st.text_area(
     "Job Description Topic",
@@ -21,12 +21,8 @@ interview_time = st.time_input("Select Interview Time")
 # ---------- Submit ----------
 if st.button("Generate JD and Select Candidates"):
 
-    if not api_key:
-        st.error("Please provide your OpenAI API Key!")
-    else:
         # Prepare payload
         payload = {
-            "api_key": api_key,
             "topic": topic,
             "iteration": iteration,
             "min_no_cv_you_want": min_no_cv,

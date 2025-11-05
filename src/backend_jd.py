@@ -18,21 +18,25 @@ from langchain_core.tools import tool
 import smtplib
 from email.mime.text import MIMEText
 import requests
+from linkdin.linked_post import linked_post_fun
 
 from fastapi import FastAPI
 #set up the openAi model 
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 
+# LLM that generates the post (creative)
+generator_llm = ChatOpenAI(api_key=api_key, model="gpt-4o")  # powerful & balanced
 
-#this llm genrate the post 
-generator_llm=ChatOpenAI(api_key=api_key,model="gpt-4o")
-#this llm evaluate the post
-evaluator_llm=ChatOpenAI(api_key=api_key,model="gpt-4o")
-#this llm update the post
-optimizer_llm=ChatOpenAI(api_key=api_key,model="gpt-4o")
-#this llm give mobile no,email,and resume summary
-resume_llm=ChatOpenAI(model="gpt-4o-mini")
+# LLM that evaluates the post (analytical)
+evaluator_llm = ChatOpenAI(api_key=api_key, model="gpt-4o-mini")  # faster, cheaper, less creative
+
+# LLM that optimizes/updates the post (refinement focus)
+optimizer_llm = ChatOpenAI(api_key=api_key, model="gpt-4-turbo")  # efficient reasoning
+
+# LLM that extracts info (resume-related)
+resume_llm = ChatOpenAI(api_key=api_key, model="gpt-4o-mini")  # compact, ideal for extraction
+
 #embedding model 
 emb_model=OpenAIEmbeddings(model='text-embedding-3-small')
 
@@ -61,6 +65,7 @@ class Jd(TypedDict):
     interview_time:Annotated[str,Field(description="here we select the interview time for student")]
     mail_generated_for_selected_students:Annotated[list[dict],operator.add]
     #mails_sent:Annotated[list[str],operator.add]
+    post_status: str
 
 #Jd store here 
 jd=[]
@@ -87,7 +92,7 @@ resume_output_llm=resume_llm.with_structured_output(OutputStructure)
 def jd_genearation(state:Jd)->Jd:
     message=[
         SystemMessage(content="you are a post genrator for a particular job topic"),
-        HumanMessage(content=f"generate a job description on this topic {state['topic']}")
+        HumanMessage(content=f"generate a job description on this topic {state['topic'] } within 100 words ")
     ]
     try:
         response=generator_llm.invoke(message).content
@@ -154,35 +159,10 @@ def route_evaluation(state:Jd):
 #----------------------Post Jd in Linkdin--------------------------------------------------------------------
 
 @traceable(name="Post JD on LinkedIn", tags=["dimension:Post"], metadata={"dimension": "post job on LinkedIn"})
-def post_linkedin(state: Jd) -> Jd:
-    """
-    Post the job description to LinkedIn via your FastAPI service.
-    Expects `state['tweet']` to contain the JD.
-    """
-
-    # Load API URL and token from environment
-    api_url = os.getenv("LINKEDIN_API_URL")  # e.g., "http://51.21.221.225:8000/post-job"
-    access_token = os.getenv("LINKEDIN_ACCESS_TOKEN")  # your token in .env
-
-    if not api_url:
-        raise ValueError("LINKEDIN_API_URL not set in environment variables!")
-    if not access_token:
-        raise ValueError("LINKEDIN_ACCESS_TOKEN not set in environment variables!")
-
-    # Only post the job text (no form, no image)
-    data = {
-        "access_token": access_token,
-        "job_text": state["tweet"]
-    }
-
-    response = requests.post(api_url, data=data)
-
-    if response.status_code != 200:
-        raise Exception(f"Failed to post job: {response.status_code} - {response.text}")
-
-    print("✅ Job posted on LinkedIn successfully!")
-    return {"linkedin_post_status": "success", "linkedin_response": response.json()}
-
+def post_in_linkdin(state:Jd):
+    # a=" ".join(state["tweet"].split())
+    linked_post_fun(state["tweet"])
+    return {"post_status":"successful"}
 
 
 #-------------------------------------------cv check node--------------------------------------------------------
@@ -425,48 +405,85 @@ def mail_generated_llm(state:Jd):
 #-----------------------------------------------create the graph------------------------------------------------------
 graph=StateGraph(Jd)
 # add nodes 
-graph.add_node("jd_genearation",jd_genearation)
-graph.add_node("jd_evaluation",jd_evaluation)
-graph.add_node("optimize_tweet",optimize_tweet)
-graph.add_node('check_cvs',check_cvs)
-graph.add_node('summarize_cv',summarize_cv)
-graph.add_node("embedding_cv",embedding_cv)
-graph.add_node("mail_generated_llm",mail_generated_llm)
-graph.add_node("fix_date_time",fix_date_time)
-#graph.add_node("send_mails_node",send_mails_node)
+# ============================
+# 🔹 Add Nodes
+# ============================
+graph.add_node("jd_genearation", jd_genearation)
+graph.add_node("jd_evaluation", jd_evaluation)
+graph.add_node("optimize_tweet", optimize_tweet)
+graph.add_node("check_cvs", check_cvs)
+graph.add_node("summarize_cv", summarize_cv)
+graph.add_node("embedding_cv", embedding_cv)
+graph.add_node("mail_generated_llm", mail_generated_llm)
+graph.add_node("fix_date_time", fix_date_time)
+graph.add_node("post_in_linkdin", post_in_linkdin)
+# graph.add_node("send_mails_node", send_mails_node)
+
+# ============================
+# 🔹 Add Edges (Flow Connections)
+# ============================
+
+# --- JD generation and evaluation ---
+graph.add_edge(START, "jd_genearation")
+graph.add_edge("jd_genearation", "jd_evaluation")
+
+# --- Conditional after JD evaluation ---
+# ✅ If approved → post on LinkedIn first
+# ✅ If needs improvement → go to optimization loop
+graph.add_conditional_edges(
+    "jd_evaluation",
+    route_evaluation,
+    {
+        "approved": "post_in_linkdin",
+        "needs_improvement": "optimize_tweet"
+    }
+)
+
+# --- Retry loop for improvement ---
+graph.add_edge("optimize_tweet", "jd_evaluation")
+
+# --- After posting on LinkedIn, move to CV checking ---
+graph.add_edge("post_in_linkdin", "check_cvs")
+
+# --- Conditional flow for CV checking ---
+graph.add_conditional_edges(
+    "check_cvs",
+    conditional_cv,
+    {
+        "enough_resumes": "summarize_cv",
+        "needs_more_resumes": "check_cvs",
+        "stop_checking": "summarize_cv"
+    }
+)
+
+# --- Continue through CV summarization and embedding ---
+graph.add_edge("summarize_cv", "embedding_cv")
+graph.add_edge("embedding_cv", END)
+
+# --- Optional (if you later include mail pipeline) ---
+# graph.add_edge("fix_date_time", "mail_generated_llm")
+# graph.add_edge("mail_generated_llm", END)
+# graph.add_edge("send_mails_node", END)
 
 
-#add edges 
-graph.add_edge(START,"jd_genearation")
-graph.add_edge("jd_genearation","jd_evaluation")
-
-#add conditional edge
-graph.add_conditional_edges("jd_evaluation", route_evaluation, {'approved':'check_cvs' , 'needs_improvement': 'optimize_tweet'})
-graph.add_edge("optimize_tweet","jd_evaluation")
-graph.add_conditional_edges("check_cvs",conditional_cv,{'enough_resumes':'summarize_cv','needs_more_resumes':"check_cvs","stop_checking":'summarize_cv'})
-graph.add_edge("summarize_cv","embedding_cv")
-graph.add_edge("embedding_cv","fix_date_time")
-graph.add_edge("fix_date_time","mail_generated_llm")
-graph.add_edge("mail_generated_llm",END)
-#graph.add_edge("send_mails_node",END)
 
 
 workflow = graph.compile()
 
 
 
-# #define initial state
-# initial_state = {
-#     "topic": "generate Job description for my company name Laxmi chect fund ,For this topic Data science ,with required skill,python,Mlops,ML,DL",
-#     "iteration": 0,
-#     "max_iteration": 5,
-#     "retry_cv":0,
-#     "max_retry_cv":3,
-#     "min_no_cv_you_want":1
+#define initial state
+initial_state = {
+    "topic": "generate Job description for my company name Laxmi chect fund ,For this topic Data science ,with required skill,python,Mlops,ML,DL",
+    "iteration": 0,
+    "max_iteration": 5,
+    "retry_cv":0,
+    "max_retry_cv":3,
+    "min_no_cv_you_want":1
 
-# }
-# result = workflow.invoke(initial_state)
-
+}
+result = workflow.invoke(initial_state)
+print(result["tweet"])
 
 # # print(result["feedback"])
 # # # print(result["tweet"])

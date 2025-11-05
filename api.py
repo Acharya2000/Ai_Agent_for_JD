@@ -7,7 +7,6 @@ from typing import Annotated
 app = FastAPI()
 
 class WorkflowInput(BaseModel):
-    api_key: str
     topic: str
     iteration: int = 0
     max_iteration: int = 5
